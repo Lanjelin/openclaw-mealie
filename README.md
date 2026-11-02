@@ -43,6 +43,8 @@ Replace the example values. Use your instance's canonical URL, including any ins
 chmod 600 ~/.openclaw/.env
 ```
 
+**Recommended:** also set `MEALIE_FILE_ROOT` to a working directory, for example `MEALIE_FILE_ROOT=~/.openclaw/workspace/mealie-files`. The helper then reads uploads and request bodies, and writes `--output` downloads, only inside that directory (symlinks are resolved first). Without it, the agent can read any file your OpenClaw user can read and send it to Mealie, and source content the agent reads (web pages, recipe notes) can try to steer which file that is. Create the directory first.
+
 Adjust the path if you use a custom state directory. No `openclaw.json` entry is required. Restart the OpenClaw Gateway and start a fresh session after updating `.env`.
 
 ### 3. Check the skill
