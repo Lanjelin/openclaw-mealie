@@ -96,6 +96,8 @@ class FixtureHandler(BaseHTTPRequestHandler):
             self.respond(200, OPENAPI)
         elif path == "/api/error":
             self.respond(422, {"detail": "Fixture validation failure"})
+        elif path == "/api/echo-auth":
+            self.respond(401, {"detail": "Bad token " + self.headers.get("Authorization", "")})
         elif path == "/api/redirect":
             self.respond(302, {"detail": "Redirect fixture"},
                          Location=self.server.redirect_target)
@@ -149,9 +151,10 @@ class MealieCLITests(unittest.TestCase):
         self.addCleanup(self.tempdir.cleanup)
         self.directory = Path(self.tempdir.name)
 
-    def cli(self, *args):
+    def cli(self, *args, **env):
         environment = os.environ.copy()
-        environment.update(MEALIE_URL=self.url, MEALIE_API_TOKEN=TOKEN)
+        environment.pop("MEALIE_FILE_ROOT", None)
+        environment.update(MEALIE_URL=self.url, MEALIE_API_TOKEN=TOKEN, **env)
         return subprocess.run(
             [sys.executable, str(HELPER), *args], env=environment,
             capture_output=True, timeout=15,
@@ -274,6 +277,103 @@ class MealieCLITests(unittest.TestCase):
         self.assertIs(payload["includeCategories"], True)
         self.assertEqual(output["slug"], RECIPE["slug"])
         self.assertEqual(output["recipe"], RECIPE)
+
+    # --- path, header and token hardening -----------------------------------
+
+    def test_traversal_and_encoded_traversal_are_rejected(self):
+        for path in ("/api/../openapi.json", "/api/%2e%2e/admin", "/api/%252e%252e/admin",
+                     "/api\\..\\admin", "/api/recipes?search=x", "/api/x#frag", "/admin/users"):
+            with self.subTest(path=path):
+                self.assert_error(self.cli("request", "GET", path))
+        self.assertEqual(self.server.requests, [])
+
+    def test_authentication_and_routing_headers_cannot_be_overridden(self):
+        for header in ("Authorization=Bearer other", "authorization=x", "Host=evil.test",
+                       "Cookie=a=b", "Proxy-Authorization=x"):
+            with self.subTest(header=header):
+                self.assert_error(self.cli("request", "GET", "/api/echo", "--header", header))
+        self.assertEqual(self.server.requests, [])
+
+    def test_token_is_redacted_from_echoed_errors(self):
+        result = self.cli("request", "GET", "/api/echo-auth")
+        self.assert_error(result)
+        stderr = result.stderr.decode()
+        self.assertNotIn(TOKEN, stderr)
+        self.assertIn("[REDACTED]", stderr)
+
+    # --- MEALIE_FILE_ROOT confinement ---------------------------------------
+
+    def _root_and_outside(self):
+        root = self.directory / "root"
+        outside = self.directory / "outside"
+        root.mkdir()
+        outside.mkdir()
+        secret = outside / "secret.json"
+        secret.write_text('{"secret": true}', encoding="utf-8")
+        return root, outside, secret
+
+    def test_file_root_unset_keeps_existing_behavior(self):
+        _, _, secret = self._root_and_outside()
+        self.assert_success(self.cli("request", "POST", "/api/echo", "--json", "@" + str(secret)))
+
+    def test_file_root_allows_files_inside(self):
+        root, _, _ = self._root_and_outside()
+        inside = root / "body.json"
+        inside.write_text('{"ok": 1}', encoding="utf-8")
+        result = self.cli("request", "POST", "/api/echo", "--json", "@" + str(inside),
+                          MEALIE_FILE_ROOT=str(root))
+        self.assert_success(result)
+        output = root / "nested-ok.bin"
+        result = self.cli("request", "GET", "/api/binary", "--output", str(output),
+                          MEALIE_FILE_ROOT=str(root))
+        self.assertEqual(result.returncode, 0, result.stderr.decode(errors="replace"))
+        self.assertEqual(output.read_bytes(), BINARY)
+
+    def test_file_root_blocks_every_read_outside(self):
+        root, _, secret = self._root_and_outside()
+        recipe = self.directory / "recipe.json"
+        recipe.write_text("{}", encoding="utf-8")
+        cases = [
+            ("request", "POST", "/api/echo", "--json", "@" + str(secret)),
+            ("request", "POST", "/api/echo", "--body", str(secret)),
+            ("request", "POST", "/api/upload", "--file", "file=" + str(secret)),
+            ("request", "POST", "/api/upload", "--file", "file=" + str(root / ".." / "outside" / "secret.json")),
+            ("import-recipe", str(recipe)),
+            ("import-ai", "--content", str(secret)),
+            ("import-ai", "--image", str(secret)),
+        ]
+        for args in cases:
+            with self.subTest(args=args):
+                self.assert_error(self.cli(*args, MEALIE_FILE_ROOT=str(root)))
+        self.assertEqual(self.server.requests, [])
+
+    def test_file_root_blocks_symlink_escape(self):
+        root, _, secret = self._root_and_outside()
+        link = root / "link.json"
+        link.symlink_to(secret)
+        self.assert_error(self.cli("request", "POST", "/api/upload", "--file", "file=" + str(link),
+                                   MEALIE_FILE_ROOT=str(root)))
+        self.assertEqual(self.server.requests, [])
+
+    def test_file_root_blocks_writes_outside_including_via_symlink(self):
+        root, outside, secret = self._root_and_outside()
+        link = root / "out.bin"
+        link.symlink_to(secret)
+        for target in (outside / "written.bin", link):
+            with self.subTest(target=target):
+                self.assert_error(self.cli("request", "GET", "/api/binary", "--output", str(target),
+                                           MEALIE_FILE_ROOT=str(root)))
+        self.assertEqual(self.server.requests, [])
+        self.assertFalse((outside / "written.bin").exists())
+        self.assertEqual(secret.read_text(encoding="utf-8"), '{"secret": true}')
+
+    def test_file_root_must_exist(self):
+        result = self.cli("request", "GET", "/api/echo",
+                          MEALIE_FILE_ROOT=str(self.directory / "missing"))
+        self.assertEqual(result.returncode, 0, result.stderr.decode(errors="replace"))
+        result = self.cli("request", "POST", "/api/echo", "--json", "@" + str(self.directory / "x"),
+                          MEALIE_FILE_ROOT=str(self.directory / "missing"))
+        self.assert_error(result)
 
 
 if __name__ == "__main__":

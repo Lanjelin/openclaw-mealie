@@ -39,8 +39,30 @@ def pairs(values):
     return result
 
 
+def local_path(path):
+    """Resolve a local file path, confined to MEALIE_FILE_ROOT when it is set.
+
+    The agent chooses these paths, and untrusted source content can influence
+    that choice; the root keeps reads (uploads, request bodies) and writes
+    (--output) inside one working directory. Symlinks are resolved first.
+    """
+    root = os.environ.get('MEALIE_FILE_ROOT', '')
+    target = Path(path).expanduser().resolve()
+    if not root:
+        return target
+    try:
+        base = Path(root).expanduser().resolve(strict=True)
+    except OSError:
+        raise ClientError('MEALIE_FILE_ROOT does not exist') from None
+    if not base.is_dir():
+        raise ClientError('MEALIE_FILE_ROOT is not a directory')
+    if target != base and base not in target.parents:
+        raise ClientError(f'Local files must be inside MEALIE_FILE_ROOT ({base})')
+    return target
+
+
 def read_text(path):
-    return sys.stdin.read() if path == '-' else Path(path).read_text(encoding='utf-8')
+    return sys.stdin.read() if path == '-' else local_path(path).read_text(encoding='utf-8')
 
 
 class Client:
@@ -82,6 +104,7 @@ class Client:
             hdrs[key] = value
         if content_type:
             hdrs['Content-Type'] = content_type
+        target = local_path(output) if output else None  # refuse before any request is sent
         req = urllib.request.Request(url, data=body, headers=hdrs, method=method.upper())
         try:
             with self.opener.open(req, timeout=120) as response:
@@ -92,9 +115,9 @@ class Client:
             raise ClientError(f'HTTP {exc.code} {method.upper()} {path}: {detail}') from None
         except urllib.error.URLError as exc:
             raise ClientError(f'Connection failed: {exc.reason}') from None
-        if output:
-            Path(output).write_bytes(data)
-            return {'output': str(output), 'bytes': len(data)}
+        if target:
+            target.write_bytes(data)
+            return {'output': str(target), 'bytes': len(data)}
         if not data:
             return None
         if media == 'application/json' or media.endswith('+json'):
@@ -119,7 +142,7 @@ def multipart(fields, files):
     for key, value in fields:
         chunks.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{quoted(key)}"\r\n\r\n'.encode() + value.encode() + b'\r\n')
     for key, filename in files:
-        file = Path(filename)
+        file = local_path(filename)
         mime = mimetypes.guess_type(file.name)[0] or 'application/octet-stream'
         chunks.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{quoted(key)}"; filename="{quoted(file.name)}"\r\nContent-Type: {mime}\r\n\r\n'.encode() + file.read_bytes() + b'\r\n')
     chunks.append(f'--{boundary}--\r\n'.encode())
@@ -134,7 +157,7 @@ def payload(args):
         value = read_text(args.json[1:]) if args.json.startswith('@') else args.json
         return json.dumps(json.loads(value)).encode(), 'application/json'
     if args.body is not None:
-        return (sys.stdin.buffer.read() if args.body == '-' else Path(args.body).read_bytes()), args.content_type or 'application/octet-stream'
+        return (sys.stdin.buffer.read() if args.body == '-' else local_path(args.body).read_bytes()), args.content_type or 'application/octet-stream'
     if files or (fields and args.content_type != 'application/x-www-form-urlencoded'):
         return multipart(fields, files)
     if fields:
@@ -219,7 +242,7 @@ def parser():
 
 def run(args):
     if args.command == 'extract-pdf':
-        result = subprocess.run(['pdftotext', '-layout', str(Path(args.file).resolve()), '-'], capture_output=True)
+        result = subprocess.run(['pdftotext', '-layout', str(local_path(args.file)), '-'], capture_output=True)
         if result.returncode:
             raise ClientError(result.stderr.decode(errors='replace'))
         text = result.stdout.decode('utf-8')
